@@ -6,175 +6,164 @@ from geometry_msgs.msg import PoseStamped
 from create_plan_msgs.srv import CreatePlan
 from nav2_simple_commander.robot_navigator import BasicNavigator
 import numpy as np
-from heapq import heappush, heappop
+import heapq
 
-
-class AStar:
-    def __init__(self, start, goal, wheelRPM, clearance, costmap_resolution, costmap_origin, costmap_data, costmap_width, costmap_height):
-        self.start = start
-        self.goal = goal
-        self.wheelRPM = wheelRPM
-        self.clearance = clearance
-        self.costmap_resolution = costmap_resolution
-        self.costmap_origin = costmap_origin
-        self.costmap_data = costmap_data
-        self.costmap_width = costmap_width
-        self.costmap_height = costmap_height
-        self.distance = {}
-        self.path = {}
-        self.costToCome = {}
-        self.costToGo = {}
-        self.goalThreshold = 15
-        self.frequency = 100
-
-    def IsValid(self, currX, currY):
-        """Check if a point is within the bounds of the costmap."""
-        return (
-            currX >= self.costmap_origin[0]
-            and currX < self.costmap_origin[0] + self.costmap_width * self.costmap_resolution
-            and currY >= self.costmap_origin[1]
-            and currY < self.costmap_origin[1] + self.costmap_height * self.costmap_resolution
-        )
-
-    def IsObstacle(self, x, y):
-        """Check if a point is an obstacle using the costmap."""
-        x_idx = int((x - self.costmap_origin[0]) / self.costmap_resolution)
-        y_idx = int((y - self.costmap_origin[1]) / self.costmap_resolution)
-
-        if x_idx < 0 or x_idx >= self.costmap_width or y_idx < 0 or y_idx >= self.costmap_height:
-            return True  # Out of bounds is treated as an obstacle
-
-        cost = self.costmap_data[y_idx * self.costmap_width + x_idx]
-        return cost > 50  # Cells with cost > 50 are treated as obstacles
-
-    def euc_heuristic(self, x, y, weight=3.0):
-        return weight * ((self.goal[0] - x) ** 2 + (self.goal[1] - y) ** 2) ** 0.5
-
-    def GetNewPositionOfRobot(self, node, leftRPM, rightRPM):
-        leftAngularVelocity = leftRPM * 2 * np.pi / 60.0
-        rightAngularVelocity = rightRPM * 2 * np.pi / 60.0
-        x, y, theta = node
-        w = (0.5 * (rightAngularVelocity - leftAngularVelocity))
-        for _ in range(self.frequency):
-            dvx = 0.5 * (leftAngularVelocity + rightAngularVelocity) * np.cos(theta)
-            dvy = 0.5 * (leftAngularVelocity + rightAngularVelocity) * np.sin(theta)
-            x += dvx / self.frequency
-            y += dvy / self.frequency
-            theta += w / self.frequency
-            if not self.IsValid(x, y) or self.IsObstacle(x, y):
-                return (x, y, theta, float('inf'), False)
-        return (x, y, theta, ((x - node[0]) ** 2 + (y - node[1]) ** 2) ** 0.5, True)
-
-    def search(self):
-        exploredStates = []
-        queue = []
-        self.costToCome[self.start] = 0
-        self.costToGo[self.start] = self.euc_heuristic(self.start[0], self.start[1])
-        self.distance[self.start] = self.costToCome[self.start] + self.costToGo[self.start]
-        heappush(queue, (self.distance[self.start], self.start))
-        while queue:
-            _, current = heappop(queue)
-            if (current[0] - self.goal[0]) ** 2 + (current[1] - self.goal[1]) ** 2 <= self.goalThreshold ** 2:
-                backtrack = []
-                while current != self.start:
-                    backtrack.append(current)
-                    current = self.path[current][0]
-                backtrack.append(self.start)
-                return exploredStates, backtrack[::-1]
-            for leftRPM, rightRPM in [(0, self.wheelRPM[0]), (self.wheelRPM[0], 0), (self.wheelRPM[1], self.wheelRPM[1])]:
-                _, newX, newY, newTheta, cost, flag = self.GetNewPositionOfRobot(current, leftRPM, rightRPM)
-                if flag:
-                    newCostToCome = self.costToCome[current] + cost
-                    newCostToGo = self.euc_heuristic(newX, newY)
-                    newDistance = newCostToCome + newCostToGo
-                    newState = (newX, newY, newTheta)
-                    if self.distance.get(newState, float('inf')) > newDistance:
-                        self.distance[newState] = newDistance
-                        self.costToCome[newState] = newCostToCome
-                        self.costToGo[newState] = newCostToGo
-                        self.path[newState] = (current, cost)
-                        heappush(queue, (newDistance, newState))
-            exploredStates.append(current)
-        return exploredStates, []
 
 class PathPlannerNode(Node):
-
     def __init__(self):
         super().__init__("path_planner_node")
+        # Create BasicNavigator instance to access the global costmap
+        self.basic_navigator = BasicNavigator()
+
+        # Create a service for handling path requests
         self.srv = self.create_service(CreatePlan, 'create_plan', self.create_plan_cb)
 
     def create_plan_cb(self, request, response):
+        """
+        Callback for the create_plan service.
+        """
+        # Retrieve the global costmap
+        global_costmap = self.basic_navigator.getGlobalCostmap()
+
+        if global_costmap is None:
+            self.get_logger().warn("Global costmap is not available!")
+            return response
+
+        # Log costmap info for debugging
+        self.get_logger().info(f"Global costmap shape: {global_costmap.shape}")
+
+        # Use the costmap for path planning
         goal_pose = request.goal
         start_pose = request.start
         time_now = self.get_clock().now().to_msg()
-        global_costmap = self.get_global_costmap()
-        response.path = self.create_astar_plan(start_pose, goal_pose, time_now, global_costmap)
+
+        response.path = create_astar_plan(
+            start_pose, goal_pose, time_now, global_costmap, resolution=0.05  # Example resolution
+        )
         return response
 
-    def get_global_costmap(self):
-        """Retrieve the global costmap."""
-        navigator = BasicNavigator()
-        costmap = navigator.getGlobalCostmap()
-        if costmap is None:
-            self.get_logger().error("Failed to retrieve the global costmap.")
-        else:
-            self.get_logger().info(f"Costmap type: {type(costmap)}, attributes: {dir(costmap)}")
-        return costmap
 
-    def create_astar_plan(self, start, goal, time_now, costmap):
-        path = Path()
-        path.header.frame_id = goal.header.frame_id
-        path.header.stamp = time_now
+def create_astar_plan(start, goal, time_now, global_costmap, resolution):
+    """
+    Creates a path using the A* algorithm with the provided global costmap.
+    """
+    path = Path()
+    path.header.frame_id = goal.header.frame_id
+    path.header.stamp = time_now
 
-        if not hasattr(costmap, 'info'):
-            self.get_logger().error("Costmap object does not have an 'info' attribute.")
-            return path
+    start_node = world_to_grid(start.pose.position.x, start.pose.position.y, global_costmap.shape, resolution)
+    goal_node = world_to_grid(goal.pose.position.x, goal.pose.position.y, global_costmap.shape, resolution)
 
-        start_coords = (start.pose.position.x, start.pose.position.y, 0.0)
-        goal_coords = (goal.pose.position.x, goal.pose.position.y)
-        astar = AStar(
-            start_coords,
-            goal_coords,
-            (100, 50),
-            clearance=50,
-            costmap_resolution=costmap.info.resolution,
-            costmap_origin=(costmap.info.origin.position.x, costmap.info.origin.position.y),
-            costmap_data=costmap.data,
-            costmap_width=costmap.info.width,
-            costmap_height=costmap.info.height,
-        )
+    if start_node is None or goal_node is None:
+        raise ValueError("Start or Goal pose is outside the grid bounds!")
 
-        if not astar.IsValid(start_coords[0], start_coords[1]) or astar.IsObstacle(start_coords[0], start_coords[1]):
-            self.get_logger().error("Start point is invalid or inside an obstacle.")
-            return path
-        if not astar.IsValid(goal_coords[0], goal_coords[1]) or astar.IsObstacle(goal_coords[0], goal_coords[1]):
-            self.get_logger().error("Goal point is invalid or inside an obstacle.")
-            return path
+    # Filter the costmap: Treat -1 (unknown) and 100 (obstacle) as non-traversable
+    traversable_grid = np.where((global_costmap == 0), 0, 1)
 
-        explored_states, backtrack_states = astar.search()
-        if not backtrack_states:
-            self.get_logger().error("No valid path found by A*.")
-            return path
+    # Perform A* path planning
+    astar_path = astar(traversable_grid, start_node, goal_node)
 
-        for state in backtrack_states:
-            pose = PoseStamped()
-            pose.pose.position.x = state[0]
-            pose.pose.position.y = state[1]
-            pose.header.stamp = time_now
-            pose.header.frame_id = goal.header.frame_id
-            path.poses.append(pose)
+    for node in astar_path:
+        pose = PoseStamped()
+        world_x, world_y = grid_to_world(node, global_costmap.shape, resolution)
+        pose.pose.position.x = world_x
+        pose.pose.position.y = world_y
+        pose.header.stamp = time_now
+        pose.header.frame_id = goal.header.frame_id
+        path.poses.append(pose)
 
-        return path
+    return path
+
+
+def astar(grid, start, goal):
+    """
+    A* algorithm implementation to find the shortest path in a grid.
+    """
+    def heuristic(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])  # Manhattan distance
+
+    open_set = []
+    heapq.heappush(open_set, (0, start))
+    came_from = {}
+    g_score = {start: 0}
+    f_score = {start: heuristic(start, goal)}
+
+    while open_set:
+        _, current = heapq.heappop(open_set)
+
+        if current == goal:
+            return reconstruct_path(came_from, current)
+
+        neighbors = get_neighbors(current, grid)
+        for neighbor in neighbors:
+            tentative_g_score = g_score[current] + 1  # Assuming uniform cost grid
+            if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g_score
+                f_score[neighbor] = tentative_g_score + heuristic(neighbor, goal)
+                if neighbor not in [n[1] for n in open_set]:
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+
+    return []  # No path found
+
+
+def get_neighbors(node, grid):
+    """
+    Get valid neighbors for a grid cell.
+    """
+    neighbors = []
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # Up, Down, Left, Right
+    for d in directions:
+        neighbor = (node[0] + d[0], node[1] + d[1])
+        if 0 <= neighbor[0] < grid.shape[0] and 0 <= neighbor[1] < grid.shape[1] and grid[neighbor] == 0:
+            neighbors.append(neighbor)
+    return neighbors
+
+
+def reconstruct_path(came_from, current):
+    """
+    Reconstruct the path from the goal to the start.
+    """
+    path = [current]
+    while current in came_from:
+        current = came_from[current]
+        path.append(current)
+    path.reverse()
+    return path
+
+
+def world_to_grid(x, y, grid_shape, resolution):
+    """
+    Convert world coordinates to grid indices.
+    """
+    grid_x = int(x / resolution)
+    grid_y = int(y / resolution)
+    if 0 <= grid_x < grid_shape[1] and 0 <= grid_y < grid_shape[0]:
+        return grid_y, grid_x
+    return None
+
+
+def grid_to_world(node, grid_shape, resolution):
+    """
+    Convert grid indices to world coordinates.
+    """
+    world_x = node[1] * resolution
+    world_y = node[0] * resolution
+    return world_x, world_y
+
 
 def main(args=None):
     rclpy.init(args=args)
     path_planner_node = PathPlannerNode()
+
     try:
         rclpy.spin(path_planner_node)
     except KeyboardInterrupt:
         pass
+
     path_planner_node.destroy_node()
     rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()
