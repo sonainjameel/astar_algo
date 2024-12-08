@@ -12,10 +12,10 @@ import heapq
 class PathPlannerNode(Node):
     def __init__(self):
         super().__init__("path_planner_node")
-        # Create BasicNavigator instance to access the global costmap
+        # Initialize BasicNavigator to access global costmap
         self.basic_navigator = BasicNavigator()
 
-        # Create a service for handling path requests
+        # Create a service to handle path planning requests
         self.srv = self.create_service(CreatePlan, 'create_plan', self.create_plan_cb)
 
     def create_plan_cb(self, request, response):
@@ -29,21 +29,32 @@ class PathPlannerNode(Node):
             self.get_logger().warn("Global costmap is not available!")
             return response
 
-        # Log costmap info for debugging
-        self.get_logger().info(f"Global costmap shape: {global_costmap.shape}")
+        # Get metadata for the costmap
+        costmap_resolution = self.basic_navigator.getCostmapResolution()  # Resolution in meters per cell
+        costmap_origin = self.basic_navigator.getCostmapOrigin()  # Origin of the costmap in world coordinates
 
-        # Use the costmap for path planning
-        goal_pose = request.goal
+        if costmap_resolution is None or costmap_origin is None:
+            self.get_logger().warn("Failed to retrieve costmap metadata!")
+            return response
+
+        # Get the start and goal poses
         start_pose = request.start
-        time_now = self.get_clock().now().to_msg()
+        goal_pose = request.goal
 
+        # Plan a path using the A* algorithm
+        time_now = self.get_clock().now().to_msg()
         response.path = create_astar_plan(
-            start_pose, goal_pose, time_now, global_costmap, resolution=0.05  # Example resolution
+            start_pose,
+            goal_pose,
+            time_now,
+            global_costmap,
+            costmap_resolution,
+            costmap_origin
         )
         return response
 
 
-def create_astar_plan(start, goal, time_now, global_costmap, resolution):
+def create_astar_plan(start, goal, time_now, global_costmap, resolution, origin):
     """
     Creates a path using the A* algorithm with the provided global costmap.
     """
@@ -51,21 +62,23 @@ def create_astar_plan(start, goal, time_now, global_costmap, resolution):
     path.header.frame_id = goal.header.frame_id
     path.header.stamp = time_now
 
-    start_node = world_to_grid(start.pose.position.x, start.pose.position.y, global_costmap.shape, resolution)
-    goal_node = world_to_grid(goal.pose.position.x, goal.pose.position.y, global_costmap.shape, resolution)
+    # Convert world coordinates to grid indices
+    start_node = world_to_grid(start.pose.position.x, start.pose.position.y, global_costmap.shape, resolution, origin)
+    goal_node = world_to_grid(goal.pose.position.x, goal.pose.position.y, global_costmap.shape, resolution, origin)
 
     if start_node is None or goal_node is None:
-        raise ValueError("Start or Goal pose is outside the grid bounds!")
+        raise ValueError("Start or Goal pose is outside the costmap bounds!")
 
     # Filter the costmap: Treat -1 (unknown) and 100 (obstacle) as non-traversable
-    traversable_grid = np.where((global_costmap == 0), 0, 1)
+    traversable_grid = np.where((global_costmap >= 0) & (global_costmap < 100), 0, 1)
 
     # Perform A* path planning
     astar_path = astar(traversable_grid, start_node, goal_node)
 
+    # Convert the grid path back to world coordinates and populate the Path message
     for node in astar_path:
         pose = PoseStamped()
-        world_x, world_y = grid_to_world(node, global_costmap.shape, resolution)
+        world_x, world_y = grid_to_world(node, global_costmap.shape, resolution, origin)
         pose.pose.position.x = world_x
         pose.pose.position.y = world_y
         pose.header.stamp = time_now
@@ -132,23 +145,23 @@ def reconstruct_path(came_from, current):
     return path
 
 
-def world_to_grid(x, y, grid_shape, resolution):
+def world_to_grid(x, y, grid_shape, resolution, origin):
     """
     Convert world coordinates to grid indices.
     """
-    grid_x = int(x / resolution)
-    grid_y = int(y / resolution)
+    grid_x = int((x - origin[0]) / resolution)
+    grid_y = int((y - origin[1]) / resolution)
     if 0 <= grid_x < grid_shape[1] and 0 <= grid_y < grid_shape[0]:
         return grid_y, grid_x
     return None
 
 
-def grid_to_world(node, grid_shape, resolution):
+def grid_to_world(node, grid_shape, resolution, origin):
     """
     Convert grid indices to world coordinates.
     """
-    world_x = node[1] * resolution
-    world_y = node[0] * resolution
+    world_x = node[1] * resolution + origin[0]
+    world_y = node[0] * resolution + origin[1]
     return world_x, world_y
 
 
